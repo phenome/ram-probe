@@ -2,6 +2,8 @@
 
 Windows terminal monitor for memory, GPU pressure, and process usage. Built with Bun, TypeScript, and Rezi.
 
+<img width="1880" height="966" alt="image" src="https://github.com/user-attachments/assets/5c241ca8-8300-47cb-96a7-8d093444b33e" />
+
 ## Features
 
 - Live RAM, commit, pagefile, kernel-pool, WDDM, DWM, and NVIDIA VRAM charts
