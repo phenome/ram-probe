@@ -126,7 +126,7 @@ while ($true) {
     $system.pagedPoolAllocatedBytes = [double]$memory.PoolPagedBytes
     $system.pagedPoolResidentBytes = [double]$memory.PoolPagedResidentBytes
     $system.nonpagedPoolBytes = [double]$memory.PoolNonpagedBytes
-    $system.pageInputsPerSecond = [double]$memory.PageInputPersec
+    $system.pageInputsPerSecond = [double]$memory.PagesInputPersec
     $system.pageReadsPerSecond = [double]$memory.PageReadsPersec
     $system.cpuHostPercent = [double]$cpu.PercentProcessorTime
     $system.diskBusyPercent = [double]$disk.PercentDiskTime

@@ -167,6 +167,14 @@ function ratio(value: number | null, total: number | null): number {
   return value === null || !total ? 0 : Math.max(0, Math.min(1, value / total));
 }
 
+function pressureStatus(value: number | null): { label: string; variant: "default" | "success" | "warning" | "error" } {
+  if (value === null) return { label: "UNKNOWN", variant: "default" };
+  if (value >= 0.9) return { label: "CRITICAL", variant: "error" };
+  if (value >= 0.8) return { label: "WARNING", variant: "warning" };
+  return { label: "OPTIMAL", variant: "success" };
+}
+
+
 function chartHistory(state: DashboardState): readonly Sample[] {
   const latest = state.snapshot.latest;
   if (!latest) return [];
@@ -188,6 +196,13 @@ function overview(state: DashboardState): VNode {
   const vram = history.map((item) => (item.nvidia.reduce((sum, adapter) => sum + (adapter.usedVramBytes ?? 0), 0)) / 1024 ** 3);
   const nvidiaUsed = sample.nvidia.reduce((sum, adapter) => sum + (adapter.usedVramBytes ?? 0), 0);
   const nvidiaTotal = sample.nvidia.reduce((sum, adapter) => sum + (adapter.totalVramBytes ?? 0), 0);
+  const commitRatio = system.committedBytes !== null && system.commitLimitBytes
+    ? system.committedBytes / system.commitLimitBytes
+    : null;
+  const commitHeadroom = system.committedBytes !== null && system.commitLimitBytes !== null
+    ? system.commitLimitBytes - system.committedBytes
+    : null;
+  const commitStatus = pressureStatus(commitRatio);
   const warningCodes = Object.keys(state.snapshot.warnings.active);
   const offender = state.snapshot.rankings?.topPrivateCommit.slice(0, 5) ?? [];
 
@@ -195,7 +210,7 @@ function overview(state: DashboardState): VNode {
     ...(warningCodes.length ? [ui.callout(warningCodes.join(", "), { variant: "error", title: "===WARNING===" })] : []),
     ui.row({ gap: 1 }, [
       ui.gauge((system.usedPhysicalPercent ?? 0) / 100, { label: `RAM ${percent(system.usedPhysicalPercent)}`, thresholds: [{ value: 0.9, variant: "warning" }, { value: 0.95, variant: "error" }] }),
-      ui.gauge(ratio(system.committedBytes, system.commitLimitBytes), { label: `Commit ${percent(ratio(system.committedBytes, system.commitLimitBytes) * 100)}` }),
+      ui.gauge(commitRatio ?? 0, { label: `Commit ${percent(commitRatio === null ? null : commitRatio * 100)}`, thresholds: [{ value: 0.8, variant: "warning" }, { value: 0.9, variant: "error" }] }),
       ui.gauge(ratio(system.pagefileCurrentBytes, system.pagefileAllocatedBytes), { label: `Pagefile ${bytes(system.pagefileCurrentBytes)}` }),
       ui.gauge(ratio(nvidiaUsed, nvidiaTotal), { label: `VRAM ${bytes(nvidiaUsed)}` }),
     ]),
@@ -215,9 +230,23 @@ function overview(state: DashboardState): VNode {
         { label: "VRAM", color: "#4ade80", fillColor: "#153d2b", data: vram, formatValue: chartGigabytes },
       ])], true)]),
     ]),
-    orangeCard("Top private commit", offender.length
-      ? offender.map((process) => ui.text(`${process.self ? "[self] " : ""}${process.name} (${process.pid})  ${bytes(process.privateBytes)}`))
-      : [ui.text("No process inventory yet")]),
+    ui.row({ gap: 1, flex: 1, minHeight: 8 }, [
+      ui.box({ border: "none", flex: 1, flexBasis: 0, height: "full" }, [orangeCard("Memory pressure", [
+        ui.row({ gap: 1 }, [
+          ui.text("Commit"),
+          ui.badge(commitStatus.label, { variant: commitStatus.variant }),
+          ui.text(percent(commitRatio === null ? null : commitRatio * 100)),
+        ]),
+        ui.text(`${bytes(system.committedBytes)} committed / ${bytes(system.commitLimitBytes)} limit`),
+        ui.text(`${bytes(commitHeadroom)} commit headroom`),
+        ui.text(`Available RAM ${bytes(system.availablePhysicalBytes)}`),
+        ui.text(`Paging ${system.pageInputsPerSecond === null ? "n/a" : Math.round(system.pageInputsPerSecond)} pages in/s, ${system.pageReadsPerSecond === null ? "n/a" : Math.round(system.pageReadsPerSecond)} reads/s`),
+        ui.text("Commit thresholds: warning 80%, critical 90%"),
+      ], true)]),
+      ui.box({ border: "none", flex: 1, flexBasis: 0, height: "full" }, [orangeCard("Top private commit", offender.length
+        ? offender.map((process) => ui.text(`${process.self ? "[self] " : ""}${process.name} (${process.pid})  ${bytes(process.privateBytes)}`))
+        : [ui.text("No process inventory yet")], true)]),
+    ]),
   ]);
 }
 
