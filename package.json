@@ -1,0 +1,19 @@
+{
+  "name": "ram-probe",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run index.ts",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@rezi-ui/core": "0.1.0-beta.2",
+    "@rezi-ui/node": "0.1.0-beta.2"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}
