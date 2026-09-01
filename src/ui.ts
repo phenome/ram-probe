@@ -464,6 +464,7 @@ function healthStrip(sample: Sample | null, wide: boolean, bordered: boolean, fl
       gauges,
       ui.row({ gap: 1, wrap: true }, [
         ui.text(`Available RAM ${bytes(system.availablePhysicalBytes)}`),
+        ui.text(`Reclaimable ${bytes(system.cacheBytes === null && system.compressionWorkingSetBytes === null ? null : (system.cacheBytes ?? 0) + (system.compressionWorkingSetBytes ?? 0))}`),
         ui.text(`Commit headroom ${bytes(system.committedBytes === null || system.commitLimitBytes === null ? null : system.commitLimitBytes - system.committedBytes)}`),
         ui.text(`Pagefile ${bytes(system.pagefileCurrentBytes)} / ${bytes(system.pagefileAllocatedBytes)}`),
         ui.text(paging),
