@@ -53,8 +53,32 @@ interface PowerShellRecord {
 }
 
 interface NvidiaState {
-  adapters: NvidiaAdapterSample[];
+  adapters: Map<string, NvidiaAdapterSample>;
   health: SourceHealth;
+}
+
+export interface NvidiaReading {
+  adapter: NvidiaAdapterSample;
+  pollTimestamp: string;
+}
+
+export interface NvidiaPollAccumulator {
+  pollTimestamp: string | null;
+  pending: Map<string, NvidiaAdapterSample>;
+}
+
+export function accumulateNvidiaPoll(
+  state: NvidiaPollAccumulator,
+  reading: NvidiaReading,
+): Map<string, NvidiaAdapterSample> | null {
+  let completed: Map<string, NvidiaAdapterSample> | null = null;
+  if (state.pollTimestamp !== null && reading.pollTimestamp !== state.pollTimestamp) {
+    completed = state.pending;
+    state.pending = new Map();
+  }
+  state.pollTimestamp = reading.pollTimestamp;
+  state.pending.set(reading.adapter.uuid, reading.adapter);
+  return completed;
 }
 
 const POWERSHELL_SCRIPT = String.raw`
@@ -278,7 +302,7 @@ async function* lines(stream: ReadableStream<Uint8Array<ArrayBuffer>>): AsyncGen
   }
 }
 
-function parseNvidia(line: string): NvidiaAdapterSample | null {
+function parseNvidia(line: string): NvidiaReading | null {
   const fields = line.split(",").map((value) => value.trim());
   if (fields.length < 14 || !fields[0]) return null;
   const number = (value: string | undefined, scale = 1): number | null => {
@@ -287,19 +311,22 @@ function parseNvidia(line: string): NvidiaAdapterSample | null {
     return Number.isFinite(parsed) ? parsed * scale : null;
   };
   return {
-    uuid: fields[0],
-    name: fields[1] || null,
-    totalVramBytes: number(fields[2], 1024 ** 2),
-    usedVramBytes: number(fields[3], 1024 ** 2),
-    freeVramBytes: number(fields[4], 1024 ** 2),
-    utilizationPercent: number(fields[5]),
-    temperatureCelsius: number(fields[6]),
-    powerWatts: number(fields[7]),
-    graphicsClockMhz: number(fields[8]),
-    memoryClockMhz: number(fields[9]),
-    pState: fields[10] || null,
-    pciBusId: fields[11] || null,
-    driverVersion: fields[12] || null,
+    adapter: {
+      uuid: fields[0],
+      name: fields[1] || null,
+      totalVramBytes: number(fields[2], 1024 ** 2),
+      usedVramBytes: number(fields[3], 1024 ** 2),
+      freeVramBytes: number(fields[4], 1024 ** 2),
+      utilizationPercent: number(fields[5]),
+      temperatureCelsius: number(fields[6]),
+      powerWatts: number(fields[7]),
+      graphicsClockMhz: number(fields[8]),
+      memoryClockMhz: number(fields[9]),
+      pState: fields[10] || null,
+      pciBusId: fields[11] || null,
+      driverVersion: fields[12] || null,
+    },
+    pollTimestamp: fields[13]!,
   };
 }
 
@@ -321,7 +348,7 @@ export function startCollector(options: CollectorOptions = {}): CollectorHandle 
   };
   const queue: RawCollectorSample[] = [];
   let nvidia: NvidiaState = {
-    adapters: [],
+    adapters: new Map(),
     health: { ...unavailableHealth("nvidia-starting", "Awaiting first NVIDIA sample"), state: "partial" },
   };
 
@@ -353,7 +380,7 @@ export function startCollector(options: CollectorOptions = {}): CollectorHandle 
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    nvidia = { adapters: [], health: unavailableHealth("nvidia-spawn", message) };
+    nvidia = { adapters: new Map(), health: unavailableHealth("nvidia-spawn", message) };
     addIssue({ source: "nvidia", errorCode: "nvidia-spawn", message });
   }
 
@@ -380,7 +407,7 @@ export function startCollector(options: CollectorOptions = {}): CollectorHandle 
         const sample: RawCollectorSample = {
           ...record,
           processes,
-          nvidia: nvidia.adapters,
+          nvidia: [...nvidia.adapters.values()],
           sources: { ...record.sources, nvidia: nvidia.health },
           issues: pendingIssues,
         };
@@ -404,23 +431,23 @@ export function startCollector(options: CollectorOptions = {}): CollectorHandle 
   if (nvidiaProcess) {
     const child = nvidiaProcess;
     void (async () => {
+      const poll: NvidiaPollAccumulator = { pollTimestamp: null, pending: new Map() };
       for await (const line of lines(child.stdout)) {
         const parsed = parseNvidia(line);
         if (!parsed) {
           if (line) addIssue({ source: "nvidia", errorCode: "malformed-line", message: line.slice(0, 512) });
           continue;
         }
-        nvidia = {
-          adapters: [parsed],
-          health: { state: "ok", latencyMs: null, ageMs: 0, exitCode: null, errorCode: null, message: null },
-        };
+        const completed = accumulateNvidiaPoll(poll, parsed);
+        if (completed) {
+          nvidia.adapters = completed;
+          nvidia.health = { state: "ok", latencyMs: null, ageMs: 0, exitCode: null, errorCode: null, message: null };
+        }
       }
       const exitCode = await child.exited;
       if (!stopped) {
-        nvidia = {
-          adapters: [],
-          health: { ...unavailableHealth("nvidia-exit", `nvidia-smi exited with ${exitCode}`), exitCode },
-        };
+        nvidia.adapters.clear();
+        nvidia.health = { ...unavailableHealth("nvidia-exit", `nvidia-smi exited with ${exitCode}`), exitCode };
         addIssue({ source: "nvidia", errorCode: "nvidia-exit", message: `nvidia-smi exited with ${exitCode}` });
       }
     })();
