@@ -11,6 +11,7 @@ import {
   compareSample,
   emptyWarningState,
   rankProcesses,
+  baseProcessName,
   updateWarnings,
   type CheckpointEvent,
   type CollectorErrorEvent,
@@ -396,8 +397,37 @@ Stop-Process -Id $targetPid -Force -ErrorAction Stop
         ]);
         if (exitCode !== 0) throw new Error(stderr.trim() || `Process termination exited with ${exitCode}`);
         addDashboardEvent("info", "process", `Killed ${target.name} (PID ${target.pid})`);
+        latestProcesses = latestProcesses.filter((candidate) => candidate.identity !== identity);
       } catch (error) {
         addDashboardEvent("error", "process", `Kill failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      publish();
+    },
+
+    async killProcessGroup(baseName: string): Promise<void> {
+      try {
+        if (process.platform !== "win32") throw new Error("Process termination is only supported on Windows");
+        const targets = latestProcesses.filter((candidate) =>
+          !candidate.self
+          && candidate.pid !== process.pid
+          && candidate.creationUtc
+          && baseProcessName(candidate.name) === baseName);
+        if (!targets.length) throw new Error(`No "${baseName}" processes in the latest inventory`);
+        // ponytail: no per-pid identity verification here (unlike killProcess); pids come from the
+        // latest inventory and a reuse window of seconds is accepted for an explicit user action.
+        const child = Bun.spawn(
+          ["taskkill.exe", "/F", "/T", ...targets.flatMap((target) => ["/PID", String(target.pid)])],
+          { stdout: "pipe", stderr: "pipe", windowsHide: true },
+        );
+        const [exitCode, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stderr).text(),
+        ]);
+        if (exitCode !== 0) throw new Error(stderr.trim() || `taskkill exited with ${exitCode}`);
+        addDashboardEvent("info", "process", `Stopped ${targets.length} "${baseName}" processes`);
+        latestProcesses = latestProcesses.filter((candidate) => !targets.some((killed) => killed.identity === candidate.identity));
+      } catch (error) {
+        addDashboardEvent("error", "process", `Group kill failed: ${error instanceof Error ? error.message : String(error)}`);
       }
       publish();
     },

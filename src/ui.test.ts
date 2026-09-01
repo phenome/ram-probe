@@ -11,6 +11,8 @@ import {
   moveProcessCursor,
   renderOverview,
   processKillTarget,
+  processGroupKillTarget,
+  openProcessGroupKill,
   renderDashboard,
   overview,
   worstAdapterPercent,
@@ -111,6 +113,9 @@ function state(): DashboardState {
     killTarget: null,
     killHelpOpen: false,
     stoppingProcessIdentity: null,
+    groupKillTarget: null,
+    groupKillHelpOpen: false,
+    stoppingGroupName: null,
   };
 }
 
@@ -315,6 +320,61 @@ test("process kill target follows the active verifiable non-self row", () => {
   expect(help).toContain("stable process identity");
 });
 
+function processFixture(identity: string, pid: number, name: string): ProcessSample {
+  return {
+    identity: `${identity}:${ORIGIN}`,
+    pid,
+    parentPid: null,
+    creationUtc: new Date(ORIGIN).toISOString(),
+    name,
+    executablePath: null,
+    commandLine: null,
+    privateBytes: 1024,
+    privateWorkingSetBytes: 1024,
+    workingSetBytes: 1024,
+    cpuCorePercent: 0,
+    cpuHostPercent: 0,
+    ioBytesPerSecond: 0,
+    threadCount: 1,
+    handleCount: 1,
+    wddmRawBytes: 0,
+    gpuCommittedBytes: 0,
+    gpuResidentBytes: 0,
+    self: false,
+  };
+}
+
+test("group kill collects every same-base process from the live inventory", () => {
+  const slack: ProcessSample = {
+    ...processFixture("1", 101, "slack"),
+  };
+  const slackHelper = processFixture("2", 102, "slack#1");
+  const chrome = processFixture("3", 103, "chrome");
+  const self = { ...processFixture("4", 104, "slack#2"), self: true };
+  const current = state();
+  current.view = 2;
+  current.snapshot.latest = point(0, 10) as unknown as Sample;
+  current.snapshot.latest = {
+    ...current.snapshot.latest,
+    processes: [slack, slackHelper, chrome, self],
+  } as Sample;
+  current.snapshot.rankings = rankProcesses([slack], []);
+  current.selectedProcessIdentity = slack.identity;
+
+  const target = processGroupKillTarget(current);
+  expect(target?.name).toBe("slack");
+  expect(target?.members.map((member) => member.pid)).toEqual([101, 102]);
+  expect(openProcessGroupKill(current).groupKillTarget?.members).toHaveLength(2);
+
+  current.snapshot.rankings = rankProcesses([chrome], []);
+  current.selectedProcessIdentity = chrome.identity;
+  expect(processGroupKillTarget(current)?.members.map((member) => member.pid)).toEqual([103]);
+
+  current.snapshot.latest = null;
+  expect(processGroupKillTarget(current)).toBeNull();
+  expect(openProcessGroupKill(current).groupKillHelpOpen).toBe(true);
+});
+
 test("events are not a trapped Tab stop", () => {
   const current = state();
   current.view = 3;
@@ -325,6 +385,7 @@ test("events are not a trapped Tab stop", () => {
   const scrolls: number[] = [];
   const dashboard = renderDashboard(
     current,
+    () => undefined,
     () => undefined,
     () => undefined,
     () => undefined,

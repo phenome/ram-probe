@@ -101,6 +101,10 @@ export function processIdentity(pid: number, creationUtc: string | null): string
   return `${pid}:${creationUtc ?? "unknown"}`;
 }
 
+export function baseProcessName(name: string): string {
+  return name.toLowerCase().replace(/#\d+$/, "");
+}
+
 export interface SystemSample {
   totalPhysicalBytes: number | null;
   availablePhysicalBytes: number | null;

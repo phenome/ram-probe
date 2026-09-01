@@ -1,5 +1,6 @@
 import { defineWidget, rgb, ui, type LogEntry, type Rgb24, type TableColumn, type VNode } from "@rezi-ui/core";
 import { createNodeApp } from "@rezi-ui/node";
+import { baseProcessName } from "./model.ts";
 import type {
   ProcessRankings,
   RankedProcess,
@@ -39,6 +40,7 @@ export interface DashboardController {
   requestHistory(windowMs: number): void;
   restartGraphicsStack(): Promise<void>;
   killProcess(identity: string): Promise<void>;
+  killProcessGroup(baseName: string): Promise<void>;
   shutdown(reason: string): Promise<void>;
 }
 
@@ -55,6 +57,9 @@ export interface DashboardState {
   killTarget: { identity: string; pid: number; name: string } | null;
   killHelpOpen: boolean;
   stoppingProcessIdentity: string | null;
+  groupKillTarget: { name: string; members: { identity: string; pid: number }[] } | null;
+  groupKillHelpOpen: boolean;
+  stoppingGroupName: string | null;
 }
 
 export const GRAPH_WINDOWS = [300_000, 1_800_000, 7_200_000, 18_000_000] as const;
@@ -473,10 +478,19 @@ function healthStrip(sample: Sample | null, wide: boolean, bordered: boolean, fl
     : [gauges, ui.text(paging, { variant: "caption" })]));
 }
 
-function attribution(state: DashboardState, dimension: "private" | "gpuResident"): readonly string[] {
+type AttributionDimension = "private" | "gpuResident" | "wddmRaw";
+
+const ATTRIBUTION_FIELDS = {
+  private: "privateBytes",
+  gpuResident: "gpuResidentBytes",
+  wddmRaw: "wddmRawBytes",
+} as const;
+
+function attribution(state: DashboardState, dimension: AttributionDimension): readonly string[] {
+  const field = ATTRIBUTION_FIELDS[dimension];
   const latest = state.snapshot.latest;
   const failed = latest
-    ? [latest.sources.process, ...(dimension === "gpuResident" ? [latest.sources.wddm] : [])]
+    ? [latest.sources.process, ...(field === "privateBytes" ? [] : [latest.sources.wddm])]
       .filter((source) => source && source.state !== "ok")
     : [];
   if (failed.length) {
@@ -485,13 +499,11 @@ function attribution(state: DashboardState, dimension: "private" | "gpuResident"
   const rankings = state.snapshot.rankings;
   if (!rankings) return ["Collecting process inventory"];
   const groups = [...rankings.byExecutable]
-    .sort((left, right) => dimension === "private"
-      ? right.privateBytes - left.privateBytes
-      : right.gpuResidentBytes - left.gpuResidentBytes)
-    .filter((group) => (dimension === "private" ? group.privateBytes : group.gpuResidentBytes) > 0)
+    .sort((left, right) => (right[field] as number) - (left[field] as number))
+    .filter((group) => (group[field] as number) > 0)
     .slice(0, 3);
   if (!groups.length) return ["No attributed allocations"];
-  return groups.map((group) => `${group.name} (${group.count})  ${bytes(dimension === "private" ? group.privateBytes : group.gpuResidentBytes)}`);
+  return groups.map((group) => `${group.name} (${group.count})  ${bytes(group[field] as number)}`);
 }
 
 function offenderCard(title: string, rows: readonly string[]): VNode {
@@ -592,6 +604,7 @@ export function renderOverview(state: DashboardState, viewport: Readonly<{ width
     healthStrip(sample, true, true, 3),
     offenderCard("Top private commit", attribution(state, "private")),
     offenderCard("Top GPU resident", attribution(state, "gpuResident")),
+    offenderCard("Top raw WDDM", attribution(state, "wddmRaw")),
   ]);
 
   const chartLayout = viewport.height < 30
@@ -619,6 +632,7 @@ export function renderOverview(state: DashboardState, viewport: Readonly<{ width
         ui.row({ gap: 2, wrap: true }, [
           ui.text(`Top private commit: ${attribution(state, "private").join(" · ")}`),
           ui.text(`Top GPU resident: ${attribution(state, "gpuResident").join(" · ")}`),
+          ui.text(`Top raw WDDM: ${attribution(state, "wddmRaw").join(" · ")}`),
         ]),
       ])]
       : []),
@@ -699,18 +713,40 @@ export function openProcessKill(state: DashboardState): DashboardState {
     : { ...state, killHelpOpen: true };
 }
 
+export function processGroupKillTarget(state: DashboardState): { name: string; members: { identity: string; pid: number }[] } | null {
+  if (state.view !== 2 || !state.snapshot.latest) return null;
+  const rows = state.snapshot.rankings ? selectedRanking(state.snapshot.rankings, state.ranking) : [];
+  const selected = activeProcess(rows, state.selectedProcessIdentity);
+  if (!selected || selected.self) return null;
+  const name = baseProcessName(selected.name);
+  const members = state.snapshot.latest.processes
+    .filter((process) => !process.self && process.creationUtc && baseProcessName(process.name) === name)
+    .map((process) => ({ identity: process.identity, pid: process.pid }))
+    .sort((left, right) => left.pid - right.pid);
+  return members.length ? { name, members } : null;
+}
+
+export function openProcessGroupKill(state: DashboardState): DashboardState {
+  const target = processGroupKillTarget(state);
+  return target
+    ? { ...state, groupKillTarget: target, groupKillHelpOpen: false }
+    : { ...state, groupKillHelpOpen: true };
+}
+
 function processes(props: {
   rankings: ProcessRankings | null;
   ranking: RankingDimension;
   selectedProcessIdentity: string | null;
   stoppingProcessIdentity: string | null;
+  stoppingGroupName: string | null;
   onSelection(process: string): void;
 }): VNode {
   if (!props.rankings) return ui.empty("Waiting for process inventory");
   const rows = selectedRanking(props.rankings, props.ranking);
   const selectedProcess = activeProcess(rows, props.selectedProcessIdentity);
+  const stopping = props.stoppingGroupName ? ` — stopping "${props.stoppingGroupName}"` : "";
   const selection = selectedProcess
-    ? `Target: ${selectedProcess.name} (PID ${selectedProcess.pid}) — k to stop`
+    ? `Target: ${selectedProcess.name} (PID ${selectedProcess.pid}) — k stop · K stop "${baseProcessName(selectedProcess.name)}" group${stopping}`
     : "No process available";
   return ui.column({ gap: 1, height: "full" }, [
     ui.text(`Ranking: ${props.ranking} | ${selection}`),
@@ -750,7 +786,6 @@ function events(state: DashboardState, onScroll: (scrollTop: number) => void): V
     scrollTop: state.eventScrollTop,
     onScroll,
     showTimestamps: true,
-    showSource: true,
     height: "full",
   });
 }
@@ -762,7 +797,7 @@ function footerLegend(state: DashboardState): string {
     const window = minutes >= 60 ? `${minutes / 60}h` : `${minutes}m`;
     return `W Window (${window})  ${freeze}  g DWM restart  q Quit`;
   }
-  if (state.view === 2) return `Tab Process  ↑↓ Target  k Stop  r Rank  ${freeze}  q Quit`;
+  if (state.view === 2) return `Tab Process  ↑↓ Target  k Stop  K Stop group  r Rank  ${freeze}  q Quit`;
   return `${freeze}  q Quit`;
 }
 
@@ -773,6 +808,7 @@ export function renderDashboard(
   onKillConfirm: (identity: string) => void,
   onKillCancel: () => void,
   onProcessSelection: (process: string) => void,
+  onGroupKillConfirm: (name: string) => void = () => undefined,
   onEventsScroll: (scrollTop: number) => void = () => undefined,
 ): VNode {
   const latest = state.snapshot.latest;
@@ -786,6 +822,7 @@ export function renderDashboard(
       ranking: state.ranking,
       selectedProcessIdentity: state.selectedProcessIdentity,
       stoppingProcessIdentity: state.stoppingProcessIdentity,
+      stoppingGroupName: state.stoppingGroupName,
       onSelection: onProcessSelection,
     })
     : events(state, onEventsScroll);
@@ -836,6 +873,29 @@ export function renderDashboard(
       onClose: onKillCancel,
     })
     : null;
+  const groupKillDialog = state.groupKillTarget
+    ? ui.dialog({
+      id: "process-group-kill-confirm",
+      title: "Stop process group",
+      message: ui.column({ gap: 1 }, [
+        ui.callout(`${state.groupKillTarget.members.length} "${state.groupKillTarget.name}" processes will be force-stopped.`, {
+          variant: "warning",
+          title: "Unsaved work may be lost",
+        }),
+        ui.text("Every process in the group is terminated; the inventory refreshes on the next sample."),
+      ]),
+      actions: [
+        { id: "process-group-kill-confirm-action", label: "OK", intent: "danger", onPress: () => onGroupKillConfirm(state.groupKillTarget!.name) },
+        { id: "process-group-kill-cancel", label: "Cancel", onPress: onKillCancel },
+      ],
+      width: 66,
+      height: 13,
+      maxWidth: "full",
+      backdrop: "dim",
+      initialFocus: "process-group-kill-confirm-action",
+      onClose: onKillCancel,
+    })
+    : null;
   const killHelpDialog = state.killHelpOpen
     ? ui.dialog({
       id: "process-kill-help",
@@ -849,6 +909,22 @@ export function renderDashboard(
       maxWidth: "full",
       backdrop: "dim",
       initialFocus: "process-kill-help-ok",
+      onClose: onKillCancel,
+    })
+    : null;
+  const groupKillHelpDialog = state.groupKillHelpOpen
+    ? ui.dialog({
+      id: "process-group-kill-help",
+      title: "No group to stop",
+      message: ui.text("No stoppable processes share the selected process name."),
+      actions: [
+        { id: "process-group-kill-help-ok", label: "OK", onPress: onKillCancel },
+      ],
+      width: 72,
+      height: 10,
+      maxWidth: "full",
+      backdrop: "dim",
+      initialFocus: "process-group-kill-help-ok",
       onClose: onKillCancel,
     })
     : null;
@@ -868,7 +944,7 @@ export function renderDashboard(
       right: [ui.text(`session ${state.snapshot.sessionId.slice(0, 8)}`)],
     }),
   ]);
-  const overlays = [graphicsResetDialog, killDialog, killHelpDialog].flatMap((layer) => layer ? [layer] : []);
+  const overlays = [graphicsResetDialog, killDialog, killHelpDialog, groupKillDialog, groupKillHelpDialog].flatMap((layer) => layer ? [layer] : []);
   return overlays.length ? ui.layers([dashboard, ...overlays]) : dashboard;
 }
 
@@ -886,10 +962,13 @@ export async function createDashboard(controller: DashboardController): Promise<
     killTarget: null,
     killHelpOpen: false,
     stoppingProcessIdentity: null,
+    groupKillTarget: null,
+    groupKillHelpOpen: false,
+    stoppingGroupName: null,
   };
   const app = createNodeApp({ initialState, config: { fpsCap: 20, rootPadding: 0 } });
   const closeGraphicsReset = (): void => app.update((state) => ({ ...state, graphicsResetOpen: false }));
-  const closeKill = (): void => app.update((state) => ({ ...state, killTarget: null, killHelpOpen: false }));
+  const closeKill = (): void => app.update((state) => ({ ...state, killTarget: null, killHelpOpen: false, groupKillTarget: null, groupKillHelpOpen: false }));
   app.view((state) => renderDashboard(
     state,
     () => {
@@ -914,6 +993,21 @@ export async function createDashboard(controller: DashboardController): Promise<
     },
     closeKill,
     (process) => app.update((state) => ({ ...state, selectedProcessIdentity: process })),
+    (name) => {
+      app.update((state) => ({
+        ...state,
+        groupKillTarget: null,
+        groupKillHelpOpen: false,
+        stoppingGroupName: name,
+      }));
+      void controller.killProcessGroup(name).finally(() => {
+        if (!controller.signal.aborted) {
+          app.update((state) => state.stoppingGroupName === name
+            ? { ...state, stoppingGroupName: null }
+            : state);
+        }
+      });
+    },
     (scrollTop) => app.update((state) => ({ ...state, eventScrollTop: scrollTop })),
   ));
   const quit = (reason: string): void => {
@@ -959,6 +1053,10 @@ export async function createDashboard(controller: DashboardController): Promise<
     k: {
       when: ({ state, focusedId }) => state.view === 2 && focusedId === "process-rows",
       handler: ({ update, state }) => update(openProcessKill(state)),
+    },
+    "shift+k": {
+      when: ({ state, focusedId }) => state.view === 2 && focusedId === "process-rows",
+      handler: ({ update, state }) => update(openProcessGroupKill(state)),
     },
     space: ({ update }) => update((state) => {
       const frozen = !state.frozen;
