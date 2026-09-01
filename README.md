@@ -28,7 +28,7 @@ bun run start --once   # collect one checkpoint, then exit
 bun run start --fresh  # ignore restored history
 ```
 
-Controls: `1`/`2`/`3` switch views, `w` changes graph window, `r` changes process ranking, `Space` freezes updates, `q` quits.
+Controls: `1`/`2`/`3` switch views, `w` changes graph window, `r` changes process ranking, `Space` freezes updates, `g` opens the elevated Desktop Window Manager restart confirmation, `q` quits.
 
 ## Check
 
