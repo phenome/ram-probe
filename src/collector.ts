@@ -126,7 +126,7 @@ while ($true) {
     pagedPoolAllocatedBytes=$null; pagedPoolResidentBytes=$null; nonpagedPoolBytes=$null
     pageInputsPerSecond=$null; pageReadsPerSecond=$null; cpuHostPercent=$null
     diskBusyPercent=$null; diskReadBytesPerSecond=$null; diskWriteBytesPerSecond=$null; diskQueueLength=$null
-    wddmDedicatedBytes=$null; wddmSharedBytes=$null; dwmWddmBytes=$null; slackWddmBytes=$null
+    wddmRawBytes=$null; gpuCommittedBytes=$null; gpuResidentBytes=$null; dwmWddmRawBytes=$null; slackWddmRawBytes=$null
     vmmemWslWorkingSetBytes=$null; wslState=$null; herdrState=$null
   }
   $displays = @()
@@ -173,13 +173,15 @@ while ($true) {
     foreach ($row in $gpuRows) {
       if ($row.Name -match 'pid_(\d+)') {
         $id = [int]$Matches[1]
-        if (-not $gpuByPid.ContainsKey($id)) { $gpuByPid[$id] = [ordered]@{dedicated=0.0; shared=0.0} }
-        $gpuByPid[$id].dedicated += [double]$row.DedicatedUsage
-        $gpuByPid[$id].shared += [double]$row.SharedUsage
+        if (-not $gpuByPid.ContainsKey($id)) { $gpuByPid[$id] = [ordered]@{raw=0.0; committed=0.0; resident=0.0} }
+        $gpuByPid[$id].raw += [double]$row.DedicatedUsage + [double]$row.SharedUsage
+        $gpuByPid[$id].committed += [double]$row.TotalCommitted
+        $gpuByPid[$id].resident += [double]$row.LocalUsage + [double]$row.NonLocalUsage
       }
     }
-    $system.wddmDedicatedBytes = SumOrNull @($gpuRows | ForEach-Object { $_.DedicatedUsage })
-    $system.wddmSharedBytes = SumOrNull @($gpuRows | ForEach-Object { $_.SharedUsage })
+    $system.wddmRawBytes = SumOrNull @($gpuRows | ForEach-Object { [double]$_.DedicatedUsage + [double]$_.SharedUsage })
+    $system.gpuCommittedBytes = SumOrNull @($gpuRows | ForEach-Object { $_.TotalCommitted })
+    $system.gpuResidentBytes = SumOrNull @($gpuRows | ForEach-Object { [double]$_.LocalUsage + [double]$_.NonLocalUsage })
     $sources.wddm = Health 'ok' $gpuClock.ElapsedMilliseconds
   } catch {
     $sources.wddm = Health 'unavailable' $gpuClock.ElapsedMilliseconds 'wddm-query' $_.Exception.Message
@@ -192,8 +194,8 @@ while ($true) {
     $slackRows = @($perfRows | Where-Object { $_.Name -like 'slack*' })
     $vmmemRows = @($perfRows | Where-Object Name -eq 'vmmemWSL')
     $compressionRows = @($perfRows | Where-Object Name -eq 'Memory Compression')
-    $system.dwmWddmBytes = SumOrNull @($dwmRows | ForEach-Object { if ($gpuByPid.ContainsKey([int]$_.IDProcess)) { $gpuByPid[[int]$_.IDProcess].dedicated + $gpuByPid[[int]$_.IDProcess].shared } })
-    $system.slackWddmBytes = SumOrNull @($slackRows | ForEach-Object { if ($gpuByPid.ContainsKey([int]$_.IDProcess)) { $gpuByPid[[int]$_.IDProcess].dedicated + $gpuByPid[[int]$_.IDProcess].shared } })
+    $system.dwmWddmRawBytes = SumOrNull @($dwmRows | ForEach-Object { if ($gpuByPid.ContainsKey([int]$_.IDProcess)) { $gpuByPid[[int]$_.IDProcess].raw } })
+    $system.slackWddmRawBytes = SumOrNull @($slackRows | ForEach-Object { if ($gpuByPid.ContainsKey([int]$_.IDProcess)) { $gpuByPid[[int]$_.IDProcess].raw } })
     $system.vmmemWslWorkingSetBytes = SumOrNull @($vmmemRows | ForEach-Object { $_.WorkingSetPrivate })
     $system.compressionWorkingSetBytes = SumOrNull @($compressionRows | ForEach-Object { $_.WorkingSet })
 
@@ -218,8 +220,9 @@ while ($true) {
           ioBytesPerSecond=if ($null -ne $_.IODataBytesPersec) { [double]$_.IODataBytesPersec } else { $null }
           threadCount=NullableNumber $_.ThreadCount
           handleCount=NullableNumber $_.HandleCount
-          wddmDedicatedBytes=if ($null -ne $gpu) { [double]$gpu.dedicated } else { $null }
-          wddmSharedBytes=if ($null -ne $gpu) { [double]$gpu.shared } else { $null }
+          wddmRawBytes=if ($null -ne $gpu) { [double]$gpu.raw } else { $null }
+          gpuCommittedBytes=if ($null -ne $gpu) { [double]$gpu.committed } else { $null }
+          gpuResidentBytes=if ($null -ne $gpu) { [double]$gpu.resident } else { $null }
         }
       })
     }

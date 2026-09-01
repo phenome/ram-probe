@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1 as const;
+export const SCHEMA_VERSION = 2 as const;
 
 export const CONFIG = Object.freeze({
   sampleIntervalMs: 2_000,
@@ -21,8 +21,8 @@ export interface Baseline {
   commitLimitBytes?: number;
   pagedPoolBytes: number;
   nonpagedPoolBytes: number;
-  wddmBytes: number;
-  dwmWddmBytes: number;
+  wddmRawBytes: number;
+  dwmWddmRawBytes: number;
 }
 
 export const HEALTHY_BASELINE: Readonly<Baseline> = Object.freeze({
@@ -31,8 +31,8 @@ export const HEALTHY_BASELINE: Readonly<Baseline> = Object.freeze({
   committedBytes: 25.06 * GB,
   pagedPoolBytes: 1.28 * GB,
   nonpagedPoolBytes: 0.94 * GB,
-  wddmBytes: 2.87 * GB,
-  dwmWddmBytes: 1.26 * GB,
+  wddmRawBytes: 2.87 * GB,
+  dwmWddmRawBytes: 1.26 * GB,
 });
 
 export const FAILURE_BASELINE: Readonly<Baseline> = Object.freeze({
@@ -42,13 +42,14 @@ export const FAILURE_BASELINE: Readonly<Baseline> = Object.freeze({
   commitLimitBytes: 83.11 * GB,
   pagedPoolBytes: 7.68 * GB,
   nonpagedPoolBytes: 5.57 * GB,
-  wddmBytes: 15 * GB,
-  dwmWddmBytes: 8.2 * GB,
+  wddmRawBytes: 15 * GB,
+  dwmWddmRawBytes: 8.2 * GB,
 });
 
 export const METRIC_CAVEATS = Object.freeze([
-  "WDDM counters measure allocated virtual GPU memory, not physical VRAM residency, and may exceed adapter capacity.",
-  "NVIDIA telemetry is adapter-wide resident VRAM; reliable per-process NVIDIA residency is unavailable through WDDM.",
+  "wddmRawBytes preserves Dedicated Usage + Shared Usage accounting; it may exceed adapter capacity and is not physical residency.",
+  "gpuCommittedBytes is WDDM Total Committed; gpuResidentBytes is WDDM Local Usage + Non Local Usage.",
+  "NVIDIA telemetry is adapter-wide VRAM residency and may not sum exactly with per-process WDDM residency.",
   "Process command lines are full and unredacted in checkpoint and warning records.",
 ]);
 
@@ -57,6 +58,7 @@ export const METRIC_DEFINITIONS: Readonly<Record<string, string>> = Object.freez
   percent: "Percentages range from 0 to 100 unless a raw process core percentage exceeds one logical core.",
   processCpu: "cpuCorePercent may exceed 100; cpuHostPercent is divided by logical processor count.",
   rates: "Per-second rates come from Windows formatted performance counters over the recorded interval.",
+  gpuMemory: "Raw WDDM accounting, committed GPU memory, and resident GPU memory are recorded separately.",
   unavailable: "Unavailable measurements are null, never copied forward or replaced with zero.",
 });
 
@@ -89,8 +91,9 @@ export interface ProcessSample {
   ioBytesPerSecond: number | null;
   threadCount: number | null;
   handleCount: number | null;
-  wddmDedicatedBytes: number | null;
-  wddmSharedBytes: number | null;
+  wddmRawBytes: number | null;
+  gpuCommittedBytes: number | null;
+  gpuResidentBytes: number | null;
   self: boolean;
 }
 
@@ -119,10 +122,11 @@ export interface SystemSample {
   diskReadBytesPerSecond: number | null;
   diskWriteBytesPerSecond: number | null;
   diskQueueLength: number | null;
-  wddmDedicatedBytes: number | null;
-  wddmSharedBytes: number | null;
-  dwmWddmBytes: number | null;
-  slackWddmBytes: number | null;
+  wddmRawBytes: number | null;
+  gpuCommittedBytes: number | null;
+  gpuResidentBytes: number | null;
+  dwmWddmRawBytes: number | null;
+  slackWddmRawBytes: number | null;
   vmmemWslWorkingSetBytes: number | null;
   wslState: string | null;
   herdrState: string | null;
@@ -191,8 +195,8 @@ export type ComparisonMetric =
   | "committedBytes"
   | "pagedPoolBytes"
   | "nonpagedPoolBytes"
-  | "wddmBytes"
-  | "dwmWddmBytes";
+  | "wddmRawBytes"
+  | "dwmWddmRawBytes";
 
 export type Comparisons = Record<ComparisonMetric, MetricComparison>;
 
@@ -202,7 +206,9 @@ export type RankingDimension =
   | "workingSet"
   | "cpu"
   | "io"
-  | "wddm"
+  | "gpuCommitted"
+  | "gpuResident"
+  | "wddmRaw"
   | "growth";
 
 export interface RankedProcess extends ProcessSample {
@@ -218,7 +224,9 @@ export interface ProcessGroup {
   workingSetBytes: number;
   cpuHostPercent: number;
   ioBytesPerSecond: number;
-  wddmBytes: number;
+  gpuCommittedBytes: number;
+  gpuResidentBytes: number;
+  wddmRawBytes: number;
   growth60SecondsBytes: number;
 }
 
@@ -228,7 +236,9 @@ export interface ProcessRankings {
   topWorkingSet: readonly RankedProcess[];
   topCpu: readonly RankedProcess[];
   topIo: readonly RankedProcess[];
-  topWddm: readonly RankedProcess[];
+  topGpuCommitted: readonly RankedProcess[];
+  topGpuResident: readonly RankedProcess[];
+  topWddmRaw: readonly RankedProcess[];
   topGrowth: readonly RankedProcess[];
   byExecutable: readonly ProcessGroup[];
 }
@@ -241,13 +251,13 @@ export type WarningCode =
   | "commit"
   | "nonpaged-pool"
   | "paged-pool"
-  | "wddm"
-  | "dwm"
-  | "slack"
+  | "wddm-raw"
+  | "dwm-raw"
+  | "slack-raw"
   | "nvidia-vram"
   | "active-paging"
   | "nonpaged-growth"
-  | "wddm-growth"
+  | "wddm-raw-growth"
   | "display-device";
 
 export interface ActiveWarning {
@@ -362,8 +372,8 @@ const COMPARISON_METRICS: readonly ComparisonMetric[] = [
   "committedBytes",
   "pagedPoolBytes",
   "nonpagedPoolBytes",
-  "wddmBytes",
-  "dwmWddmBytes",
+  "wddmRawBytes",
+  "dwmWddmRawBytes",
 ];
 
 function metricValue(sample: Sample, metric: ComparisonMetric): number | null {
@@ -374,11 +384,8 @@ function metricValue(sample: Sample, metric: ComparisonMetric): number | null {
     case "committedBytes": return system.committedBytes;
     case "pagedPoolBytes": return system.pagedPoolAllocatedBytes;
     case "nonpagedPoolBytes": return system.nonpagedPoolBytes;
-    case "wddmBytes":
-      return system.wddmDedicatedBytes === null && system.wddmSharedBytes === null
-        ? null
-        : (system.wddmDedicatedBytes ?? 0) + (system.wddmSharedBytes ?? 0);
-    case "dwmWddmBytes": return system.dwmWddmBytes;
+    case "wddmRawBytes": return system.wddmRawBytes;
+    case "dwmWddmRawBytes": return system.dwmWddmRawBytes;
   }
 }
 
@@ -389,8 +396,8 @@ function baselineValue(baseline: Baseline, metric: ComparisonMetric): number | n
     case "committedBytes": return baseline.committedBytes;
     case "pagedPoolBytes": return baseline.pagedPoolBytes;
     case "nonpagedPoolBytes": return baseline.nonpagedPoolBytes;
-    case "wddmBytes": return baseline.wddmBytes;
-    case "dwmWddmBytes": return baseline.dwmWddmBytes;
+    case "wddmRawBytes": return baseline.wddmRawBytes;
+    case "dwmWddmRawBytes": return baseline.dwmWddmRawBytes;
   }
 }
 
@@ -451,11 +458,6 @@ export function compareSample(current: Sample, previous: Sample | null, history:
   })) as Comparisons;
 }
 
-function processWddm(process: ProcessSample): number | null {
-  return process.wddmDedicatedBytes === null && process.wddmSharedBytes === null
-    ? null
-    : (process.wddmDedicatedBytes ?? 0) + (process.wddmSharedBytes ?? 0);
-}
 
 function ranked(
   processes: readonly ProcessSample[],
@@ -494,7 +496,9 @@ export function rankProcesses(processes: readonly ProcessSample[], history: read
       workingSetBytes: 0,
       cpuHostPercent: 0,
       ioBytesPerSecond: 0,
-      wddmBytes: 0,
+      gpuCommittedBytes: 0,
+      gpuResidentBytes: 0,
+      wddmRawBytes: 0,
       growth60SecondsBytes: 0,
     };
     group.count++;
@@ -503,7 +507,9 @@ export function rankProcesses(processes: readonly ProcessSample[], history: read
     group.workingSetBytes += process.workingSetBytes ?? 0;
     group.cpuHostPercent += process.cpuHostPercent ?? 0;
     group.ioBytesPerSecond += process.ioBytesPerSecond ?? 0;
-    group.wddmBytes += processWddm(process) ?? 0;
+    group.gpuCommittedBytes += process.gpuCommittedBytes ?? 0;
+    group.gpuResidentBytes += process.gpuResidentBytes ?? 0;
+    group.wddmRawBytes += process.wddmRawBytes ?? 0;
     group.growth60SecondsBytes += growthByIdentity.get(process.identity) ?? 0;
     groups.set(name, group);
   }
@@ -514,7 +520,9 @@ export function rankProcesses(processes: readonly ProcessSample[], history: read
     topWorkingSet: ranked(processes, growthByIdentity, (process) => process.workingSetBytes),
     topCpu: ranked(processes, growthByIdentity, (process) => process.cpuHostPercent),
     topIo: ranked(processes, growthByIdentity, (process) => process.ioBytesPerSecond),
-    topWddm: ranked(processes, growthByIdentity, processWddm),
+    topGpuCommitted: ranked(processes, growthByIdentity, (process) => process.gpuCommittedBytes),
+    topGpuResident: ranked(processes, growthByIdentity, (process) => process.gpuResidentBytes),
+    topWddmRaw: ranked(processes, growthByIdentity, (process) => process.wddmRawBytes),
     topGrowth: ranked(processes, growthByIdentity, (process) => growthByIdentity.get(process.identity) ?? null),
     byExecutable: [...groups.values()].sort((left, right) => right.privateBytes - left.privateBytes || left.name.localeCompare(right.name)),
   };
@@ -563,10 +571,10 @@ function candidates(sample: Sample, comparisons: Comparisons): Partial<Record<Wa
   add("commit", commitSeverity, commitPercent, "Commit charge pressure");
   add("nonpaged-pool", severityAt(system.nonpagedPoolBytes, 3 * GB, 5 * GB), system.nonpagedPoolBytes, "Nonpaged pool pressure");
   add("paged-pool", severityAt(system.pagedPoolAllocatedBytes, 5 * GB, 7 * GB), system.pagedPoolAllocatedBytes, "Paged pool pressure");
-  const wddm = comparisons.wddmBytes.current;
-  add("wddm", severityAt(wddm, 8 * GB, 12 * GB), wddm, "WDDM allocation pressure");
-  add("dwm", severityAt(system.dwmWddmBytes, 4 * GB, 7 * GB), system.dwmWddmBytes, "Desktop Window Manager WDDM pressure");
-  add("slack", severityAt(system.slackWddmBytes, 5 * GB, 20 * GB), system.slackWddmBytes, "Slack WDDM pressure");
+  const wddmRaw = comparisons.wddmRawBytes.current;
+  add("wddm-raw", severityAt(wddmRaw, 8 * GB, 12 * GB), wddmRaw, "Raw WDDM accounting pressure");
+  add("dwm-raw", severityAt(system.dwmWddmRawBytes, 4 * GB, 7 * GB), system.dwmWddmRawBytes, "Desktop Window Manager raw WDDM pressure");
+  add("slack-raw", severityAt(system.slackWddmRawBytes, 5 * GB, 20 * GB), system.slackWddmRawBytes, "Slack raw WDDM pressure");
   add("nvidia-vram", severityAt(nvidiaPercent, 90, 97), nvidiaPercent, "NVIDIA VRAM pressure");
   if ((ramSeverity || commitSeverity) && (system.pageInputsPerSecond ?? 0) >= 100) {
     add("active-paging", "warning", system.pageInputsPerSecond, "Active paging under memory pressure");
@@ -574,8 +582,8 @@ function candidates(sample: Sample, comparisons: Comparisons): Partial<Record<Wa
   if (comparisons.nonpagedPoolBytes.valid10MinutePoints >= 5) {
     add("nonpaged-growth", severityAt(comparisons.nonpagedPoolBytes.delta10Minutes, 0.5 * GB, Number.POSITIVE_INFINITY), comparisons.nonpagedPoolBytes.delta10Minutes, "Nonpaged pool grew at least 0.5 GB in 10 minutes");
   }
-  if (comparisons.wddmBytes.valid10MinutePoints >= 5) {
-    add("wddm-growth", severityAt(comparisons.wddmBytes.delta10Minutes, 2 * GB, Number.POSITIVE_INFINITY), comparisons.wddmBytes.delta10Minutes, "WDDM allocations grew at least 2 GB in 10 minutes");
+  if (comparisons.wddmRawBytes.valid10MinutePoints >= 5) {
+    add("wddm-raw-growth", severityAt(comparisons.wddmRawBytes.delta10Minutes, 2 * GB, Number.POSITIVE_INFINITY), comparisons.wddmRawBytes.delta10Minutes, "Raw WDDM accounting grew at least 2 GB in 10 minutes");
   }
   const badDisplay = sample.displays.find((display) => !display.informational && display.errorCode !== null && display.errorCode !== 0);
   if (badDisplay) add("display-device", "warning", badDisplay.errorCode, `${badDisplay.name} reports device error ${badDisplay.errorCode}`);

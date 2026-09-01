@@ -6,8 +6,8 @@ Windows terminal monitor for memory, GPU pressure, and process usage. Built with
 
 ## Features
 
-- Live RAM, commit, pagefile, kernel-pool, WDDM, DWM, and NVIDIA VRAM charts
-- Executable and process rankings by memory, CPU, I/O, GPU allocation, or growth
+- Separate charts for committed GPU memory, resident GPU memory, raw WDDM accounting, DWM, and NVIDIA VRAM
+- Executable and process rankings by memory, CPU, I/O, GPU committed/resident/raw values, or growth
 - Linked, stable table selection across refreshes and ranking changes
 - Warning and event view
 - Rotating NDJSON logs in `logs/`, with recent-state restoration

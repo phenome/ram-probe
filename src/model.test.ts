@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LogWriter, shouldDeleteLogFile } from "./logging.ts";
+import { LogWriter, mergeSampleHistory, shouldDeleteLogFile } from "./logging.ts";
 import {
   compareSample,
   emptyWarningState,
@@ -44,10 +44,11 @@ function sample(index: number, failure = false, ramOverride?: number | null): Sa
       diskReadBytesPerSecond: 0,
       diskWriteBytesPerSecond: 0,
       diskQueueLength: 0,
-      wddmDedicatedBytes: (failure ? 15 : 2.87) * GB,
-      wddmSharedBytes: 0,
-      dwmWddmBytes: (failure ? 8.2 : 1.26) * GB,
-      slackWddmBytes: 0,
+      wddmRawBytes: (failure ? 15 : 2.87) * GB,
+      gpuCommittedBytes: 2 * GB,
+      gpuResidentBytes: 1.5 * GB,
+      dwmWddmRawBytes: (failure ? 8.2 : 1.26) * GB,
+      slackWddmRawBytes: 0,
       vmmemWslWorkingSetBytes: 0,
       wslState: "stopped",
       herdrState: "unknown",
@@ -77,8 +78,9 @@ function process(pid: number, creationUtc: string, privateBytes: number | null):
     ioBytesPerSecond: 0,
     threadCount: 1,
     handleCount: 1,
-    wddmDedicatedBytes: null,
-    wddmSharedBytes: null,
+    wddmRawBytes: null,
+    gpuCommittedBytes: null,
+    gpuResidentBytes: null,
     self: false,
   };
 }
@@ -106,11 +108,11 @@ describe("warning hysteresis", () => {
     const failure = evaluate([sample(3, true), sample(4, true), sample(5, true)], healthy.state);
     expect(failure.transitions.sort()).toEqual([
       "open:commit",
-      "open:dwm",
+      "open:dwm-raw",
       "open:nonpaged-pool",
       "open:paged-pool",
       "open:ram",
-      "open:wddm",
+      "open:wddm-raw",
     ]);
   });
 
@@ -133,15 +135,30 @@ test("ranking ties use PID ascending", () => {
   expect(rankings.topPrivateCommit.map((row) => row.pid)).toEqual([2, 9]);
 });
 
+test("GPU rankings separate committed, resident, and raw WDDM values", () => {
+  const anomalous = process(1, "a", 10);
+  anomalous.wddmRawBytes = 120 * GB;
+  anomalous.gpuCommittedBytes = 400 * 1024 ** 2;
+  anomalous.gpuResidentBytes = 200 * 1024 ** 2;
+  const resident = process(2, "b", 10);
+  resident.wddmRawBytes = 2 * GB;
+  resident.gpuCommittedBytes = 1 * GB;
+  resident.gpuResidentBytes = 800 * 1024 ** 2;
+
+  const rankings = rankProcesses([anomalous, resident]);
+  expect(rankings.topGpuCommitted[0]?.pid).toBe(2);
+  expect(rankings.topGpuResident[0]?.pid).toBe(2);
+  expect(rankings.topWddmRaw[0]?.pid).toBe(1);
+});
+
 test("null metrics remain unavailable", () => {
   const current = sample(0, false, null);
   current.system.availablePhysicalBytes = null;
   current.system.committedBytes = null;
   current.system.pagedPoolAllocatedBytes = null;
   current.system.nonpagedPoolBytes = null;
-  current.system.wddmDedicatedBytes = null;
-  current.system.wddmSharedBytes = null;
-  current.system.dwmWddmBytes = null;
+  current.system.wddmRawBytes = null;
+  current.system.dwmWddmRawBytes = null;
   const comparisons = compareSample(current, null, []);
   expect(comparisons.ramUsedPercent.current).toBeNull();
   expect(comparisons.ramUsedPercent.rolling1Minute.count).toBe(0);
@@ -166,6 +183,16 @@ test("retention deletes only old matching daily logs", () => {
   expect(shouldDeleteLogFile("unrelated-2026-07-01.ndjson", old, now)).toBe(false);
 });
 
+test("late history backfill preserves concurrent live samples", () => {
+  const timestampUtc = "2026-07-15T11:30:00.000Z";
+  const persisted = { ...sample(1), timestampUtc, processes: [] };
+  const live = { ...sample(2), timestampUtc, processes: [process(42, timestampUtc, 123)] };
+  const merged = mergeSampleHistory([persisted], [live], Date.parse("2026-07-15T07:00:00.000Z"));
+
+  expect(merged.history).toHaveLength(1);
+  expect(merged.history[0]?.processes[0]?.pid).toBe(42);
+});
+
 test("recent persisted samples restore inside history window", async () => {
   const directory = await mkdtemp(join(tmpdir(), "ram-probe-"));
   const now = new Date("2026-07-15T12:00:00Z");
@@ -179,7 +206,7 @@ test("recent persisted samples restore inside history window", async () => {
     for (let index = 0; index < stored.length; index++) {
       const current = stored[index]!;
       const event: SampleEvent = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         kind: "sample",
         sessionId: "restore-test",
         sequence: index + 1,
@@ -193,7 +220,44 @@ test("recent persisted samples restore inside history window", async () => {
       };
       expect(await writer.append(event)).toBe(true);
     }
-    expect((await writer.loadRecentSamples()).map((current) => current.timestampUtc)).toEqual(["2026-07-15T11:30:00.000Z"]);
+    expect((await writer.loadRecentSamples(2 * 60 * 60 * 1_000)).map((current) => current.timestampUtc)).toEqual(["2026-07-15T11:30:00.000Z"]);
+    expect((await writer.loadRecentSamples()).map((current) => current.timestampUtc)).toEqual([
+      "2026-07-15T08:00:00.000Z",
+      "2026-07-15T11:30:00.000Z",
+    ]);
+  } finally {
+    await writer.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("recent history stops before rotated files older than the cutoff", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "ram-probe-"));
+  const now = new Date("2026-07-15T12:00:00Z");
+  const writer = new LogWriter({ directory, now: () => now });
+  const recent = { ...sample(1), timestampUtc: "2026-07-15T11:30:00.000Z" };
+  const old = { ...sample(0), timestampUtc: "2026-07-15T08:00:00.000Z" };
+  const [recentLine, oldLine] = [recent, old].map((current, index) => JSON.stringify({
+    schemaVersion: 2,
+    kind: "sample",
+    sessionId: "rotated-history-test",
+    sequence: index + 1,
+    timestampUtc: current.timestampUtc,
+    monotonicMs: current.monotonicMs,
+    intervalMs: current.intervalMs,
+    sources: current.sources,
+    sample: current,
+    comparisons: compareSample(current, null, []),
+    warnings: emptyWarningState(),
+  } satisfies SampleEvent));
+  try {
+    await writeFile(join(directory, "ram-probe-2026-07-15-10.ndjson"), `${recentLine}\n`);
+    await writeFile(join(directory, "ram-probe-2026-07-15-9.ndjson"), `${oldLine}\n`);
+    await mkdir(join(directory, "ram-probe-2026-07-15-8.ndjson"));
+
+    expect((await writer.loadRecentSamples(2 * 60 * 60 * 1_000)).map((current) => current.timestampUtc)).toEqual([
+      recent.timestampUtc,
+    ]);
   } finally {
     await writer.close();
     await rm(directory, { recursive: true, force: true });
