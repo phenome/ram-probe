@@ -130,7 +130,6 @@ export interface SystemSample {
   gpuCommittedBytes: number | null;
   gpuResidentBytes: number | null;
   dwmWddmRawBytes: number | null;
-  slackWddmRawBytes: number | null;
   vmmemWslWorkingSetBytes: number | null;
   wslState: string | null;
   herdrState: string | null;
@@ -257,7 +256,6 @@ export type WarningCode =
   | "paged-pool"
   | "wddm-raw"
   | "dwm-raw"
-  | "slack-raw"
   | "nvidia-vram"
   | "active-paging"
   | "nonpaged-growth"
@@ -578,7 +576,6 @@ function candidates(sample: Sample, comparisons: Comparisons): Partial<Record<Wa
   const wddmRaw = comparisons.wddmRawBytes.current;
   add("wddm-raw", severityAt(wddmRaw, 8 * GB, 12 * GB), wddmRaw, "Raw WDDM accounting pressure");
   add("dwm-raw", severityAt(system.dwmWddmRawBytes, 4 * GB, 7 * GB), system.dwmWddmRawBytes, "Desktop Window Manager raw WDDM pressure");
-  add("slack-raw", severityAt(system.slackWddmRawBytes, 5 * GB, 20 * GB), system.slackWddmRawBytes, "Slack raw WDDM pressure");
   add("nvidia-vram", severityAt(nvidiaPercent, 90, 97), nvidiaPercent, "NVIDIA VRAM pressure");
   if ((ramSeverity || commitSeverity) && (system.pageInputsPerSecond ?? 0) >= 100) {
     add("active-paging", "warning", system.pageInputsPerSecond, "Active paging under memory pressure");

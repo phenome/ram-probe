@@ -126,7 +126,7 @@ while ($true) {
     pagedPoolAllocatedBytes=$null; pagedPoolResidentBytes=$null; nonpagedPoolBytes=$null
     pageInputsPerSecond=$null; pageReadsPerSecond=$null; cpuHostPercent=$null
     diskBusyPercent=$null; diskReadBytesPerSecond=$null; diskWriteBytesPerSecond=$null; diskQueueLength=$null
-    wddmRawBytes=$null; gpuCommittedBytes=$null; gpuResidentBytes=$null; dwmWddmRawBytes=$null; slackWddmRawBytes=$null
+    wddmRawBytes=$null; gpuCommittedBytes=$null; gpuResidentBytes=$null; dwmWddmRawBytes=$null
     vmmemWslWorkingSetBytes=$null; wslState=$null; herdrState=$null
   }
   $displays = @()
@@ -191,11 +191,9 @@ while ($true) {
   try {
     $perfRows = @(Get-CimInstance Win32_PerfFormattedData_PerfProc_Process | Where-Object { $_.IDProcess -gt 0 })
     $dwmRows = @($perfRows | Where-Object Name -eq 'dwm')
-    $slackRows = @($perfRows | Where-Object { $_.Name -like 'slack*' })
     $vmmemRows = @($perfRows | Where-Object Name -eq 'vmmemWSL')
     $compressionRows = @($perfRows | Where-Object Name -eq 'Memory Compression')
     $system.dwmWddmRawBytes = SumOrNull @($dwmRows | ForEach-Object { if ($gpuByPid.ContainsKey([int]$_.IDProcess)) { $gpuByPid[[int]$_.IDProcess].raw } })
-    $system.slackWddmRawBytes = SumOrNull @($slackRows | ForEach-Object { if ($gpuByPid.ContainsKey([int]$_.IDProcess)) { $gpuByPid[[int]$_.IDProcess].raw } })
     $system.vmmemWslWorkingSetBytes = SumOrNull @($vmmemRows | ForEach-Object { $_.WorkingSetPrivate })
     $system.compressionWorkingSetBytes = SumOrNull @($compressionRows | ForEach-Object { $_.WorkingSet })
 

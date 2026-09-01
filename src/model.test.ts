@@ -48,7 +48,6 @@ function sample(index: number, failure = false, ramOverride?: number | null): Sa
       gpuCommittedBytes: 2 * GB,
       gpuResidentBytes: 1.5 * GB,
       dwmWddmRawBytes: (failure ? 8.2 : 1.26) * GB,
-      slackWddmRawBytes: 0,
       vmmemWslWorkingSetBytes: 0,
       wslState: "stopped",
       herdrState: "unknown",
