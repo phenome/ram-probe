@@ -1,6 +1,6 @@
 import { arch, cpus, hostname, platform, release, totalmem } from "node:os";
 import { startCollector, type RawCollectorSample } from "./src/collector.ts";
-import { LogWriter } from "./src/logging.ts";
+import { LogWriter, mergeSampleHistory } from "./src/logging.ts";
 import {
   CONFIG,
   FAILURE_BASELINE,
@@ -64,41 +64,42 @@ async function main(once: boolean, fresh: boolean): Promise<void> {
       message: error instanceof Error ? error.message : String(error),
     };
   }
-  const latestLoad = fresh ? { event: null, note: null } : await logger.loadLatest();
-  const restoredHistory = fresh ? [] : await logger.loadRecentSamples();
-  const priorFullEvent = latestLoad.event?.kind === "checkpoint" || latestLoad.event?.kind === "warning" ? latestLoad.event : null;
-  const restoredLatest = priorFullEvent?.sample ?? restoredHistory.at(-1) ?? null;
-  const initialHistory = restoredLatest
-    ? restoredHistory.map((sample) => ({
-      ...sample,
-      monotonicMs: restoredLatest.monotonicMs - Math.max(0, Date.parse(restoredLatest.timestampUtc) - Date.parse(sample.timestampUtc)),
-    }))
-    : restoredHistory;
-  let previousCheckpointSample = priorFullEvent?.sample ?? null;
-  let previousCheckpointTimestampUtc = priorFullEvent?.timestampUtc ?? null;
+  const latestLoadPromise = fresh ? Promise.resolve({ event: null, note: null }) : logger.loadLatest();
+  let previousCheckpointSample: Sample | null = null;
+  let previousCheckpointTimestampUtc: string | null = null;
+  let dashboardCheckpointTimestampUtc: string | null = null;
   const collector = startCollector();
   const terminalAbort = new AbortController();
   const listeners = new Set<(snapshot: DashboardSnapshot) => void>();
   const dashboardEvents: DashboardEvent[] = [];
   let sequence = 0;
-  let previous: Sample | null = restoredLatest;
-  let latestProcesses: readonly ProcessSample[] = priorFullEvent?.sample.processes ?? [];
-  let latestDisplays: Sample["displays"] = restoredLatest?.displays ?? [];
-  let lastSources: Sources = restoredLatest?.sources ?? {};
-  let history: Sample[] = initialHistory;
-  let rankings: ProcessRankings | null = priorFullEvent?.rankings ?? null;
-  let warnings: WarningState = priorFullEvent?.warnings ?? emptyWarningState();
+  let previous: Sample | null = null;
+  let latestProcesses: readonly ProcessSample[] = [];
+  let latestDisplays: Sample["displays"] = [];
+  let lastSources: Sources = {};
+  let liveHistory: Sample[] = [];
+  let persistedHistory: Sample[] = [];
+  let history: Sample[] = [];
+  let rankings: ProcessRankings | null = null;
+  let warnings: WarningState = emptyWarningState();
   let lastCheckpointMonotonic: number | null = null;
   let latestComparisons: Comparisons | null = null;
-  let restoredNeedsRebase = history.length > 0 || previous !== null;
+  let historyStatus = {
+    requestedWindowMs: 0,
+    loadedWindowMs: 0,
+    loading: false,
+    error: null as string | null,
+  };
+  let historyLoadPromise: Promise<void> | null = null;
   let snapshot: DashboardSnapshot = {
     sessionId,
-    latest: restoredLatest,
+    latest: null,
     history,
+    historyStatus,
     rankings,
     warnings,
     events: dashboardEvents,
-    checkpointTimestampUtc: previousCheckpointTimestampUtc,
+    checkpointTimestampUtc: dashboardCheckpointTimestampUtc,
   };
   let shutdownPromise: Promise<void> | null = null;
 
@@ -123,12 +124,55 @@ async function main(once: boolean, fresh: boolean): Promise<void> {
       sessionId,
       latest,
       history,
+      historyStatus,
       rankings,
       warnings,
       events: [...dashboardEvents],
-      checkpointTimestampUtc: previousCheckpointTimestampUtc,
+      checkpointTimestampUtc: dashboardCheckpointTimestampUtc,
     };
     for (const listener of listeners) listener(snapshot);
+  };
+
+  const rebasePersistedHistory = (timestampUtc: string, monotonicMs: number): void => {
+    const anchorTimestampMs = Date.parse(timestampUtc);
+    persistedHistory = persistedHistory.map((sample) => ({
+      ...sample,
+      monotonicMs: monotonicMs + Date.parse(sample.timestampUtc) - anchorTimestampMs,
+    }));
+  };
+
+  const rebuildHistory = (): void => {
+    const merged = mergeSampleHistory(persistedHistory, liveHistory, Date.now() - CONFIG.historyWindowMs);
+    persistedHistory = merged.persisted;
+    liveHistory = merged.live;
+    history = merged.history;
+  };
+
+  const loadRequestedHistory = async (): Promise<void> => {
+    while (historyStatus.loadedWindowMs < historyStatus.requestedWindowMs) {
+      const windowMs = historyStatus.requestedWindowMs;
+      try {
+        const loaded = await logger.loadRecentSamples(windowMs);
+        persistedHistory.push(...loaded);
+        const anchor = liveHistory.at(-1);
+        if (anchor) rebasePersistedHistory(anchor.timestampUtc, anchor.monotonicMs);
+        rebuildHistory();
+        historyStatus = {
+          ...historyStatus,
+          loadedWindowMs: Math.max(historyStatus.loadedWindowMs, windowMs),
+          error: null,
+        };
+        publish();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        historyStatus = { ...historyStatus, loading: false, error: message };
+        addDashboardEvent("error", "history", `History load failed: ${message}`);
+        publish();
+        return;
+      }
+    }
+    historyStatus = { ...historyStatus, loading: false };
+    publish();
   };
 
   const writeEvent = async (event: ProbeEvent): Promise<boolean> => {
@@ -190,7 +234,14 @@ async function main(once: boolean, fresh: boolean): Promise<void> {
   await writeEvent(sessionStart);
   addDashboardEvent("info", "session", `Started ${sessionId}`, sessionStart.timestampUtc);
 
-  if (latestLoad.note) {
+  publish();
+  const priorStateTask = latestLoadPromise.then(async (latestLoad) => {
+    const prior = latestLoad.event?.kind === "checkpoint" || latestLoad.event?.kind === "warning" ? latestLoad.event : null;
+    if (lastCheckpointMonotonic === null && prior) {
+      previousCheckpointSample = prior.sample;
+      previousCheckpointTimestampUtc = prior.timestampUtc;
+    }
+    if (!latestLoad.note) return;
     const note: CollectorErrorEvent = {
       ...eventFields("collector-error", new Date().toISOString(), performance.now() - sessionStarted, 0, { logging: loggingHealth }),
       kind: "collector-error",
@@ -200,14 +251,13 @@ async function main(once: boolean, fresh: boolean): Promise<void> {
     };
     await writeEvent(note);
     addDashboardEvent("info", "logging", latestLoad.note, note.timestampUtc);
-  }
-  if (fresh) addDashboardEvent("info", "session", "Fresh start requested", sessionStart.timestampUtc);
-  else if (restoredLatest) addDashboardEvent("info", "session", `Restored ${history.length} recent samples`, sessionStart.timestampUtc);
-  publish(restoredLatest);
+    publish();
+  });
 
   const shutdown = (reason: string): Promise<void> => {
     if (shutdownPromise) return shutdownPromise;
     shutdownPromise = (async () => {
+      await priorStateTask;
       await collector.stop(reason);
       const timestampUtc = new Date().toISOString();
       if (
@@ -256,21 +306,110 @@ async function main(once: boolean, fresh: boolean): Promise<void> {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
+    requestHistory(windowMs: number) {
+      if (!Number.isFinite(windowMs) || windowMs <= 0) return;
+      const requestedWindowMs = Math.min(CONFIG.historyWindowMs, windowMs);
+      historyStatus = {
+        ...historyStatus,
+        requestedWindowMs: Math.max(historyStatus.requestedWindowMs, requestedWindowMs),
+      };
+      if (fresh) {
+        historyStatus = {
+          ...historyStatus,
+          loadedWindowMs: historyStatus.requestedWindowMs,
+          loading: false,
+          error: null,
+        };
+        publish();
+        return;
+      }
+      if (historyStatus.requestedWindowMs <= historyStatus.loadedWindowMs) {
+        publish();
+        return;
+      }
+      historyStatus = { ...historyStatus, loading: true };
+      if (!historyLoadPromise) {
+        historyLoadPromise = Promise.resolve().then(loadRequestedHistory).finally(() => {
+          historyLoadPromise = null;
+        });
+      }
+      publish();
+    },
+    async restartGraphicsStack(): Promise<void> {
+      try {
+        if (process.platform !== "win32") throw new Error("Graphics restart is only supported on Windows");
+        const command = String.raw`
+try {
+  $reset = Start-Process -FilePath "$env:SystemRoot\System32\taskkill.exe" -Verb RunAs -ArgumentList @('/F', '/IM', 'dwm.exe') -WindowStyle Hidden -Wait -PassThru
+  exit $reset.ExitCode
+} catch {
+  Write-Error $_.Exception.Message
+  exit 1
+}
+`;
+        const child = Bun.spawn(
+          ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+          { stdout: "pipe", stderr: "pipe", windowsHide: true },
+        );
+        const [exitCode, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stderr).text(),
+        ]);
+        if (exitCode !== 0) throw new Error(stderr.trim() || `DWM restart exited with ${exitCode}`);
+        addDashboardEvent("info", "graphics", "Restarted Desktop Window Manager");
+      } catch (error) {
+        addDashboardEvent("error", "graphics", `Graphics restart failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      publish();
+    },
+    async killProcess(identity: string): Promise<void> {
+      const target = latestProcesses.find((candidate) => candidate.identity === identity);
+      try {
+        if (!target) throw new Error("Process is no longer present in the latest inventory");
+        if (target.self || target.pid === process.pid) throw new Error("Refusing to terminate ram-probe");
+        if (!target.creationUtc) throw new Error("Process creation time is unavailable; identity cannot be verified");
+        const command = String.raw`
+$targetPid = [int]$env:RAM_PROBE_TARGET_PID
+$expectedCreation = $env:RAM_PROBE_TARGET_CREATED
+$target = Get-CimInstance Win32_Process -Filter "ProcessId = $targetPid" -ErrorAction Stop
+if ($null -eq $target) { throw "Process $targetPid is no longer running" }
+$actualCreation = $target.CreationDate.ToUniversalTime().ToString('o')
+if ($actualCreation -ne $expectedCreation) { throw "Process identity changed; refusing to terminate PID $targetPid" }
+Stop-Process -Id $targetPid -Force -ErrorAction Stop
+`;
+        const child = Bun.spawn(
+          ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+          {
+            env: {
+              ...process.env,
+              RAM_PROBE_TARGET_PID: String(target.pid),
+              RAM_PROBE_TARGET_CREATED: target.creationUtc,
+            },
+            stdout: "pipe",
+            stderr: "pipe",
+            windowsHide: true,
+          },
+        );
+        const [exitCode, stderr] = await Promise.all([
+          child.exited,
+          new Response(child.stderr).text(),
+        ]);
+        if (exitCode !== 0) throw new Error(stderr.trim() || `Process termination exited with ${exitCode}`);
+        addDashboardEvent("info", "process", `Killed ${target.name} (PID ${target.pid})`);
+      } catch (error) {
+        addDashboardEvent("error", "process", `Kill failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      publish();
+    },
     shutdown,
   };
 
   const processRaw = async (raw: RawCollectorSample): Promise<CheckpointEvent | null> => {
+    await priorStateTask;
     if (raw.processes) latestProcesses = raw.processes;
     if (raw.processInventoryFresh) latestDisplays = raw.displays;
-    if (restoredNeedsRebase) {
-      const currentTimestampMs = Date.parse(raw.timestampUtc);
-      const rebase = (stored: Sample): Sample => ({
-        ...stored,
-        monotonicMs: raw.monotonicMs - Math.max(0, currentTimestampMs - Date.parse(stored.timestampUtc)),
-      });
-      history = history.map(rebase);
-      if (previous) previous = rebase(previous);
-      restoredNeedsRebase = false;
+    if (!liveHistory.length && persistedHistory.length) {
+      rebasePersistedHistory(raw.timestampUtc, raw.monotonicMs);
     }
     const sources = mergedSources(raw.sources, raw.intervalMs);
     const sample: Sample = {
@@ -284,13 +423,13 @@ async function main(once: boolean, fresh: boolean): Promise<void> {
       processInventoryFresh: raw.processInventoryFresh,
       sources,
     };
-    let comparisons = compareSample(sample, previous, history);
+    let comparisons = compareSample(sample, previous, liveHistory);
     comparisons = previousCheckpointComparisons(sample, comparisons);
     latestComparisons = comparisons;
-    history.push(sample);
-    while (history.length > 3_600 || sample.monotonicMs - history[0]!.monotonicMs > CONFIG.historyWindowMs) history.shift();
-    if (raw.processInventoryFresh) rankings = rankProcesses(latestProcesses, history);
-    rankings ??= rankProcesses(latestProcesses, history);
+    liveHistory.push(sample);
+    rebuildHistory();
+    if (raw.processInventoryFresh) rankings = rankProcesses(latestProcesses, liveHistory);
+    rankings ??= rankProcesses(latestProcesses, liveHistory);
     const warningUpdate = updateWarnings(warnings, sample, comparisons);
     warnings = warningUpdate.state;
     const compactSample: Sample = { ...sample, processes: [] };
@@ -347,6 +486,7 @@ async function main(once: boolean, fresh: boolean): Promise<void> {
       lastCheckpointMonotonic = sample.monotonicMs;
       previousCheckpointSample = sample;
       previousCheckpointTimestampUtc = sample.timestampUtc;
+      dashboardCheckpointTimestampUtc = sample.timestampUtc;
       addDashboardEvent("info", "checkpoint", `Checkpoint ${sample.timestampUtc}`, sample.timestampUtc);
     }
     previous = sample;

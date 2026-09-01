@@ -1,5 +1,7 @@
+import { createReadStream } from "node:fs";
 import { appendFile, mkdir, readdir, rename, stat, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { createInterface } from "node:readline";
 import { CONFIG, SCHEMA_VERSION, type ProbeEvent, type Sample } from "./model.ts";
 
 const LOG_PATTERN = /^ram-probe-(\d{4}-\d{2}-\d{2})(?:-(\d+))?\.ndjson$/;
@@ -26,6 +28,31 @@ export function isProbeLogFilename(filename: string): boolean {
 
 export function shouldDeleteLogFile(filename: string, modifiedMs: number, nowMs: number): boolean {
   return isProbeLogFilename(filename) && modifiedMs < nowMs - CONFIG.retentionDays * 86_400_000;
+}
+
+export function mergeSampleHistory(
+  persisted: readonly Sample[],
+  live: readonly Sample[],
+  cutoffMs: number,
+): { persisted: Sample[]; live: Sample[]; history: Sample[] } {
+  const persistedByTimestamp = new Map<number, Sample>();
+  for (const sample of persisted) {
+    const timestampMs = Date.parse(sample.timestampUtc);
+    if (timestampMs < cutoffMs) continue;
+    const existing = persistedByTimestamp.get(timestampMs);
+    if (!existing || sample.processes.length > existing.processes.length) persistedByTimestamp.set(timestampMs, sample);
+  }
+  const retainedLive = live
+    .filter((sample) => Date.parse(sample.timestampUtc) >= cutoffMs)
+    .sort((left, right) => Date.parse(left.timestampUtc) - Date.parse(right.timestampUtc));
+  const byTimestamp = new Map(persistedByTimestamp);
+  for (const sample of retainedLive) byTimestamp.set(Date.parse(sample.timestampUtc), sample);
+  const byTime = (left: Sample, right: Sample): number => Date.parse(left.timestampUtc) - Date.parse(right.timestampUtc);
+  return {
+    persisted: [...persistedByTimestamp.values()].sort(byTime),
+    live: retainedLive,
+    history: [...byTimestamp.values()].sort(byTime),
+  };
 }
 
 export class LogWriter {
@@ -71,33 +98,44 @@ export class LogWriter {
     }
   }
 
-  async loadRecentSamples(windowMs = CONFIG.historyWindowMs): Promise<Sample[]> {
+  async loadRecentSamples(windowMs: number = CONFIG.historyWindowMs): Promise<Sample[]> {
     const cutoffMs = this.now().getTime() - windowMs;
     const cutoffDay = new Date(cutoffMs).toISOString().slice(0, 10);
-    const filenames = (await readdir(this.directory))
-      .filter((filename) => {
+    const files = (await readdir(this.directory))
+      .flatMap((filename) => {
         const match = LOG_PATTERN.exec(filename);
-        return match?.[1] !== undefined && match[1] >= cutoffDay;
+        return match?.[1] !== undefined && match[1] >= cutoffDay
+          ? [{ filename, date: match[1], index: Number(match[2] ?? 0) }]
+          : [];
       })
-      .sort();
+      .sort((left, right) => right.date.localeCompare(left.date) || right.index - left.index);
     const samples = new Map<string, Sample>();
-    for (const filename of filenames) {
-      const text = await Bun.file(join(this.directory, filename)).text();
-      for (const line of text.split("\n")) {
-        if (!line) continue;
-        try {
-          const event = JSON.parse(line) as ProbeEvent;
-          if (event.schemaVersion === SCHEMA_VERSION && event.kind === "sample" && Date.parse(event.timestampUtc) >= cutoffMs) {
-            samples.set(`${event.sessionId}:${event.timestampUtc}`, event.sample);
+    for (const file of files) {
+      const input = createReadStream(join(this.directory, file.filename), { encoding: "utf8" });
+      const reader = createInterface({ input, crlfDelay: Infinity });
+      let crossedCutoff = false;
+      try {
+        for await (const line of reader) {
+          if (!line) continue;
+          try {
+            const event = JSON.parse(line) as ProbeEvent;
+            if (event.schemaVersion !== SCHEMA_VERSION || event.kind !== "sample") continue;
+            const timestampMs = Date.parse(event.timestampUtc);
+            if (timestampMs >= cutoffMs) samples.set(`${event.sessionId}:${event.timestampUtc}`, event.sample);
+            else if (Number.isFinite(timestampMs)) crossedCutoff = true;
+          } catch {
+            // Ignore one malformed historical line; live logging remains authoritative.
           }
-        } catch {
-          // Ignore one malformed historical line; live logging remains authoritative.
         }
+      } finally {
+        reader.close();
+        input.destroy();
       }
+      if (crossedCutoff) break;
     }
     return [...samples.values()]
       .sort((left, right) => Date.parse(left.timestampUtc) - Date.parse(right.timestampUtc))
-      .slice(-Math.ceil(CONFIG.historyWindowMs / CONFIG.sampleIntervalMs));
+      .slice(-Math.ceil(windowMs / CONFIG.sampleIntervalMs));
   }
 
   append(event: ProbeEvent): Promise<boolean> {

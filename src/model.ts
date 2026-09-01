@@ -4,7 +4,7 @@ export const CONFIG = Object.freeze({
   sampleIntervalMs: 2_000,
   processIntervalMs: 10_000,
   checkpointIntervalMs: 600_000,
-  historyWindowMs: 7_200_000,
+  historyWindowMs: 18_000_000,
   retentionDays: 7,
   maxLogFileBytes: 52_428_800,
   topProcessCount: 15,
