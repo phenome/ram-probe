@@ -1,0 +1,15 @@
+diff --git a/dist/app/widgetRenderer/mouseRouting.js b/dist/app/widgetRenderer/mouseRouting.js
+--- a/dist/app/widgetRenderer/mouseRouting.js
++++ b/dist/app/widgetRenderer/mouseRouting.js
+@@ -1224,9 +1224,9 @@
+             }
+         }
+     }
+     const candidateIds = allowFocusFallback
+-        ? [ctx.mouseTargetId, ctx.focusedId]
+-        : [ctx.mouseTargetId];
++        ? [ctx.mouseTargetId, ctx.mouseTargetAnyId, ctx.focusedId]
++        : [ctx.mouseTargetId, ctx.mouseTargetAnyId];
+     for (const candidateId of candidateIds) {
+         if (candidateId === null)
+             continue;

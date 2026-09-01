@@ -15,5 +15,8 @@
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "^5"
+  },
+  "patchedDependencies": {
+    "@rezi-ui/core@0.1.0-beta.2": "patches/rezi-ui-core-wheel-target.patch"
   }
 }

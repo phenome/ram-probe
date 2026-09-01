@@ -14,6 +14,9 @@
       },
     },
   },
+  "patchedDependencies": {
+    "@rezi-ui/core@0.1.0-beta.2": "patches/rezi-ui-core-wheel-target.patch",
+  },
   "packages": {
     "@rezi-ui/core": ["@rezi-ui/core@0.1.0-beta.2", "", {}, "sha512-XWr4Qf1fp02rAEYZQDYS4FEK3UH4pSsC7c5xDJa7KrS7rHJNyvbLKf14iNRPAhTgWK95RRJcMSBb0PlfImL6XQ=="],
 
